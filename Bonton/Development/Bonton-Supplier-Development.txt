@@ -1,0 +1,158 @@
+pipeline {
+    agent { label 'built-in' }
+
+    environment {
+        REPO_URL    = 'https://github.com/MultiiconIdeotechnology/Bonton_Web_Supplier_Office.git'
+        REPO_BRANCH = 'developer'
+        GIT_CRED    = 'MM_PAT'
+
+        DEPLOY_ROOT = 'D:\\devam\\Website\\Bonton\\developer.supplier.bontonholidays.com'
+        APP_POOL    = 'developer.supplier.bontonholidays.com'
+        EXCLUDE_FILE = 'web.config'
+
+        NODE_PATH   = 'C:\\Program Files\\nvm\\v20.12.2'
+        ANGULAR_PROJECT = 'supplier-panels'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${REPO_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Build Angular') {
+            steps {
+                powershell '''
+                    $env:PATH = "${env:NODE_PATH};" + $env:PATH
+                    node -v
+                    npm -v
+
+                    Write-Host "📦 Installing npm dependencies..."
+                    npm install --legacy-peer-deps
+                    if ($LASTEXITCODE -ne 0) { throw "❌ npm install failed." }
+                    Write-Host "✅ npm install completed successfully."
+
+                    $projectName = "$env:ANGULAR_PROJECT"
+                    Write-Host "⚡ Running Angular build (project: $projectName, config: developer)..."
+                    npx ng build $projectName --configuration=developer
+
+                    if (Test-Path "$env:WORKSPACE\\dist\\$projectName\\browser") {
+                        $buildPath = "$env:WORKSPACE\\dist\\$projectName\\browser"
+                    } elseif (Test-Path "$env:WORKSPACE\\dist\\$projectName") {
+                        $buildPath = "$env:WORKSPACE\\dist\\$projectName"
+                    } else {
+                        throw "❌ Build failed. dist/$projectName (or dist/$projectName/browser) folder not found."
+                    }
+
+                    $count = (Get-ChildItem $buildPath -Recurse -File).Count
+                    Write-Host "✅ Build completed. Build output found in $buildPath with $count files."
+                '''
+            }
+        }
+
+        stage('Deploy to IIS') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    Import-Module WebAdministration
+
+                    $projectName = "$env:ANGULAR_PROJECT"
+
+                    if (Test-Path "$env:WORKSPACE\\dist\\$projectName\\browser") {
+                        $publishDir = "$env:WORKSPACE\\dist\\$projectName\\browser"
+                    } else {
+                        $publishDir = "$env:WORKSPACE\\dist\\$projectName"
+                    }
+
+                    $deployRoot = "$env:DEPLOY_ROOT"
+                    $appPool    = "$env:APP_POOL"
+
+                    if (-not (Test-Path $publishDir)) { throw "❌ Publish folder not found: $publishDir" }
+
+                    $maxRetries = 10
+                    $sleepSec   = 7
+
+                    # --- Stop App Pool with retry ---
+                    Write-Host "⏹️ Stopping App Pool: $appPool"
+                    try {
+                        Stop-WebAppPool -Name $appPool -ErrorAction Stop
+                    } catch {
+                        Write-Host "⚠️ Stop-WebAppPool threw an error (probably already stopped): $_"
+                    }
+
+                    $stopped = $false
+                    for ($i = 1; $i -le $maxRetries; $i++) {
+                        $state = (Get-WebAppPoolState -Name $appPool).Value
+                        if ($state -eq "Stopped") {
+                            Write-Host "✅ App Pool stopped successfully (attempt $i)."
+                            $stopped = $true
+                            break
+                        }
+                        Write-Host "⏳ Waiting for App Pool to stop... (Attempt $i/$maxRetries)"
+                        Start-Sleep -Seconds $sleepSec
+                    }
+                    if (-not $stopped) { throw "❌ Failed to stop App Pool after $maxRetries attempts." }
+
+                    # --- Deploy files ---
+                    Write-Host "🚀 Deploying files from $publishDir to $deployRoot (excluding $env:EXCLUDE_FILE)"
+                    robocopy "$publishDir" "$deployRoot" /E /XF "$env:EXCLUDE_FILE" /NFL /NDL /NP /NJH /NJS
+                    $rc = $LASTEXITCODE
+                    if ($rc -ge 0 -and $rc -le 7) {
+                        Write-Host "🎉 Deployment completed successfully! (Robocopy Exit Code: $rc)"
+                        $global:LASTEXITCODE = 0
+                    } else {
+                        Write-Error "❌ Deployment failed! (Robocopy Exit Code: $rc)"
+                        exit 1
+                    }
+
+                    # --- Start App Pool with retry ---
+                    Write-Host "▶️ Starting App Pool: $appPool"
+                    try {
+                        Start-WebAppPool -Name $appPool -ErrorAction Stop
+                    } catch {
+                        Write-Host "⚠️ Start-WebAppPool threw an error: $_"
+                    }
+
+                    $started = $false
+                    for ($i = 1; $i -le $maxRetries; $i++) {
+                        $state = (Get-WebAppPoolState -Name $appPool).Value
+                        if ($state -eq "Started") {
+                            Write-Host "✅ App Pool started successfully (attempt $i)."
+                            $started = $true
+                            break
+                        }
+                        Write-Host "⏳ Waiting for App Pool to start... (Attempt $i/$maxRetries)"
+                        Start-Sleep -Seconds $sleepSec
+                    }
+                    if (-not $started) { throw "❌ Failed to start App Pool after $maxRetries attempts." }
+
+                    Write-Host "🎉 Deployment completed successfully."
+                '''
+            }
+        }
+
+        stage('Deployment Summary') {
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+                    if (Test-Path "$env:DEPLOY_ROOT") {
+                        $files = Get-ChildItem -Path "$env:DEPLOY_ROOT" -Recurse -File
+                        Write-Host ("Total files deployed (excluding $env:EXCLUDE_FILE): {0}" -f $files.Count)
+                    } else {
+                        Write-Host "❌ Deployment folder missing!"
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ Angular IIS deployment successful." }
+        failure { echo "❌ Deployment failed. Check console logs for details." }
+        always  { echo "ℹ️ Pipeline execution complete." }
+    }
+}
