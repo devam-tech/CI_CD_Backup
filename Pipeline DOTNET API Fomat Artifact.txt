@@ -4,7 +4,7 @@ pipeline {
     environment {
         REPO_URL       = ''
         REPO_BRANCH    = ''
-        GIT_CRED       = 'MM_PAT'
+        GIT_CRED       = ''
 
         DOTNET_PROJECT = '' 
         PUBLISH_DIR    = 'publish_output'
@@ -144,3 +144,4 @@ try {
         always  { echo '📝 Pipeline finished.' }
     }
 }
+
