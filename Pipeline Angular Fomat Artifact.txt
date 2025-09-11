@@ -5,9 +5,9 @@ pipeline {
        
         REPO_URL     = ''
         REPO_BRANCH  = ''
-        GIT_CRED     = 'MM_PAT'
+        GIT_CRED     = ''
 
-        DEPLOY_ROOT  = 'D:\\jenkins-agent\\Testing\\'
+        DEPLOY_ROOT  = ''
         APP_POOL     = ''
     }
 
@@ -167,3 +167,4 @@ pipeline {
         always  { echo "ℹ️ Pipeline execution complete." }
     }
 }
+
