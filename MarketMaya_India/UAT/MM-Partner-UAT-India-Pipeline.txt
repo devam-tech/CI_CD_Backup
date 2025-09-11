@@ -1,0 +1,112 @@
+pipeline {
+    agent { label 'built-in' }
+
+    environment {
+        REPO_URL    = 'https://github.com/MultiiconIdeotechnology/MM_Web_Partner.git'
+        REPO_BRANCH = 'uat_india'
+        GIT_CRED    = 'MM_PAT'
+
+        DEPLOY_ROOT = 'D:\\Website\\MarketMaya\\uat.partner.marketmaya.com'
+        APP_POOL    = 'uat.partner.marketmaya.com'
+        EXCLUDE_FILE = 'web.config'
+
+        // 👇 Force Node 16.20.2 from NVM path
+        PATH = "C:\\Program Files\\nvm\\v16.20.2;${env.PATH}"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${REPO_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Build Angular') {
+            steps {
+                powershell '''
+                    Write-Host "📦 Using Node & npm version:"
+                    node -v
+                    npm -v
+
+                    Write-Host "📦 Installing npm dependencies..."
+                    npm install --legacy-peer-deps
+                    if ($LASTEXITCODE -ne 0) { throw "❌ npm install failed." }
+
+                    Write-Host "⚡ Running Angular build (config: uat)..."
+                    npx ng build --configuration=uat
+
+                    $distPath = Join-Path $env:WORKSPACE "dist\\fuse"
+
+                    if (!(Test-Path $distPath)) {
+                        throw "❌ Angular build did not produce dist/fuse. Check angular-errors.log"
+                    }
+
+                    # Handle SSR/browser case
+                    $browserPath = Join-Path $distPath "browser"
+                    if (Test-Path $browserPath) {
+                        Write-Host "📂 Found dist/fuse/browser, using that instead."
+                        $distPath = $browserPath
+                    }
+
+                    $count = (Get-ChildItem $distPath -Recurse -File).Count
+                    Write-Host "✅ Build completed. dist/fuse exists with $count files."
+                '''
+            }
+        }
+
+        stage('Deploy to IIS') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    Import-Module WebAdministration
+
+                    # Detect the correct publish dir
+                    $basePath   = Join-Path $env:WORKSPACE "dist\\fuse"
+                    $publishDir = $basePath
+                    if (Test-Path (Join-Path $basePath "browser")) {
+                        $publishDir = Join-Path $basePath "browser"
+                    }
+
+                    $deployRoot = "$env:DEPLOY_ROOT"
+                    $appPool    = "$env:APP_POOL"
+
+                    if (-not (Test-Path $publishDir)) { throw "❌ Publish folder not found: $publishDir" }
+
+                    Write-Host "Stopping App Pool: $appPool"
+                    try {
+                        $state = (Get-WebAppPoolState -Name $appPool).Value
+                        if ($state -ne 'Stopped') { Stop-WebAppPool -Name $appPool -ErrorAction Stop }
+                    } catch {
+                        Write-Host "⚠️ Could not stop app pool (might already be stopped): $_"
+                    }
+
+                    Write-Host "Deploying files from $publishDir to $deployRoot (excluding $env:EXCLUDE_FILE)"
+                    robocopy "$publishDir" "$deployRoot" /E /XF "$env:EXCLUDE_FILE" /NFL /NDL /NP /NJH /NJS
+                    $rc = $LASTEXITCODE
+                    Write-Host "Robocopy returned exit code: $rc"
+
+                    if ($rc -ge 8) {
+                        throw "❌ Robocopy failed with exit code $rc"
+                    } else {
+                        Write-Host "✅ Deployment success. Robocopy exit code: $rc"
+                        $global:LASTEXITCODE = 0
+                    }
+
+                    Write-Host "Starting App Pool: $appPool"
+                    Start-WebAppPool -Name $appPool
+
+                    Write-Host "✅ Deployment completed successfully."
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ Angular IIS deployment successful." }
+        failure { echo "❌ Deployment failed. Check console logs for details." }
+        always  { echo "ℹ️ Pipeline execution complete." }
+    }
+}
