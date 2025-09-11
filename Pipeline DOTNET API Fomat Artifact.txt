@@ -1,0 +1,146 @@
+pipeline {
+    agent none
+
+    environment {
+        REPO_URL       = ''
+        REPO_BRANCH    = ''
+        GIT_CRED       = 'MM_PAT'
+
+        DOTNET_PROJECT = '' 
+        PUBLISH_DIR    = 'publish_output'
+        DEPLOY_ROOT    = ''    
+        APP_POOL_NAME  = ''  
+    }
+
+    stages {
+        stage('Build') {
+            agent { label 'built-in' }
+
+            stages {
+                stage('Checkout') {
+                    steps {
+                        echo "🔄 Checking out '${env.REPO_BRANCH}' from '${env.REPO_URL}'..."
+                        checkout([$class: 'GitSCM',
+                            branches: [[name: "*/${env.REPO_BRANCH}"]],
+                            userRemoteConfigs: [[url: "${env.REPO_URL}", credentialsId: "${env.GIT_CRED}"]]
+                        ])
+                    }
+                }
+
+                stage('Build & Publish') {
+                    steps {
+                        echo '🛠 Restoring, building, and publishing project...'
+                        bat "dotnet restore ${env.DOTNET_PROJECT}"
+                        bat "dotnet build ${env.DOTNET_PROJECT} -c Release"
+                        bat "dotnet publish ${env.DOTNET_PROJECT} -c Release -o ${env.PUBLISH_DIR}"
+                    }
+                }
+
+                stage('Archive & Stash') {
+                    steps {
+                        echo '📦 Archiving and stashing publish_output...'
+                        archiveArtifacts artifacts: "${env.PUBLISH_DIR}/**", fingerprint: true
+                        stash name: 'publish_output', includes: "${env.PUBLISH_DIR}/**"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            agent { label 'aws-marketmaya-india-windows' }
+
+            steps {
+                echo '🚀 Deploying to IIS...'
+                unstash 'publish_output'
+
+                powershell """
+try {
+    # Stop App Pool
+    Write-Host "🛑 Stopping App Pool: ${env.APP_POOL_NAME}"
+    \$retries = 10
+    while (\$retries -gt 0) {
+        try {
+            Stop-WebAppPool -Name '${env.APP_POOL_NAME}' -ErrorAction Stop
+            Write-Host "✅ App Pool stopped."
+            break
+        } catch {
+            Write-Warning "⚠ Retry stopping App Pool... (\$retries left)"
+            Start-Sleep -Seconds 7
+            \$retries--
+        }
+    }
+
+    # Offline notice
+    Set-Content -Path '${env.DEPLOY_ROOT}\\app_offline.html' -Value '<html>Updating, please wait...</html>'
+
+    # Deploy files (no delete, only update)
+    robocopy '${env.WORKSPACE}\\${env.PUBLISH_DIR}' '${env.DEPLOY_ROOT}' /E /XO /XF web.config *.json /NFL /NDL /NP
+    \$rc = \$LASTEXITCODE
+    Write-Host "🔹 Robocopy Exit Code: \$rc"
+
+    # Remove offline file
+    Remove-Item '${env.DEPLOY_ROOT}\\app_offline.html' -Force -ErrorAction SilentlyContinue
+
+    # Start App Pool
+    Write-Host "🔄 Starting App Pool: ${env.APP_POOL_NAME}"
+    \$retries = 10
+    while (\$retries -gt 0) {
+        try {
+            Start-WebAppPool -Name '${env.APP_POOL_NAME}' -ErrorAction Stop
+            Write-Host "✅ App Pool started."
+            break
+        } catch {
+            Write-Warning "⚠ Retry starting App Pool... (\$retries left)"
+            Start-Sleep -Seconds 7
+            \$retries--
+        }
+    }
+
+    # Handle robocopy result
+    if (\$rc -ge 0 -and \$rc -le 7) {
+        Write-Host "🎉 Deployment successful! (Code: \$rc)"
+        exit 0
+    } elseif (\$rc -gt 7 -and \$rc -lt 16) {
+        Write-Warning "⚠ Deployment completed with warnings. (Code: \$rc)"
+        exit 0
+    } else {
+        Write-Error "❌ Deployment failed! (Code: \$rc)"
+        exit 1
+    }
+
+} catch {
+    Write-Error "❌ Deployment error: \$_.Exception.Message"
+    exit 1
+}
+"""
+            }
+        }
+
+        stage('Rollback') {
+            when {
+                expression { currentBuild.currentResult == "FAILURE" }
+            }
+            steps {
+                echo '🔄 Rollback triggered. Restarting IIS App Pool...'
+                powershell """
+try {
+    if ((Get-WebAppPoolState -Name '${env.APP_POOL_NAME}').Value -ne 'Started') {
+        Start-WebAppPool -Name '${env.APP_POOL_NAME}'
+        Write-Host "✅ App Pool restarted."
+    } else {
+        Write-Host "ℹ App Pool already running."
+    }
+} catch {
+    Write-Error "❌ Rollback failed: \$_.Exception.Message"
+}
+"""
+            }
+        }
+    }
+
+    post {
+        success { echo '✅ Pipeline completed successfully!' }
+        failure { echo '❌ Pipeline failed. Check logs.' }
+        always  { echo '📝 Pipeline finished.' }
+    }
+}
