@@ -1,0 +1,181 @@
+pipeline {
+    agent { label 'built-in' }
+
+    environment {
+        REPO_URL        = 'https://github.com/MultiiconIdeotechnology/MT5FeedServer.git'
+        REPO_BRANCH     = 'uat_global'
+        GIT_CRED        = 'MM_PAT'
+
+        DOTNET_PROJECT  = 'MT5FeedServer'
+        WORKSPACE_PUBLISH_DIR = "${env.WORKSPACE}\\${env.DOTNET_PROJECT}\\bin\\Debug\\"
+
+        DEPLOY_ROOT     = 'D:\\Website\\MarketMaya\\'
+        APP_POOL        = ''
+
+        // Explicit MSBuild path (Visual Studio 2022)
+        MSBUILD_EXE     = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe"
+
+        // Force NuGet cache location (avoids systemprofile path issues)
+        NUGET_PACKAGES  = "D:\\devam\\.nuget\\packages"
+    }
+
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                  branches: [[name: "*/${REPO_BRANCH}"]],
+                  userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Sanity checks') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+
+                    if (-not (Test-Path "$env:DEPLOY_ROOT")) { 
+                        New-Item -ItemType Directory -Force -Path "$env:DEPLOY_ROOT" | Out-Null 
+                    }
+
+                    Import-Module WebAdministration -ErrorAction Stop
+                    if (-not (Get-WebAppPoolState -Name $env:APP_POOL)) {
+                        throw "App Pool $env:APP_POOL not found in IIS!"
+                    }
+
+                    git --version | Out-Null
+                    dotnet --version | Out-Null
+                    Write-Host "Current HEAD: $(git rev-parse HEAD).Trim()"
+                '''
+            }
+        }
+
+        stage('Restore & Build') {
+            steps {
+                // Restore using dotnet (ensures all packages are in place)
+                bat "dotnet restore ${DOTNET_PROJECT}.sln"
+
+                powershell '''
+                    if (-not (Test-Path "$env:WORKSPACE_PUBLISH_DIR")) {
+                        New-Item -ItemType Directory -Force -Path "$env:WORKSPACE_PUBLISH_DIR" | Out-Null
+                    }
+                '''
+
+                script {
+                    def msbuildCmd = "\"${env.MSBUILD_EXE}\" " +
+                                     "\"${DOTNET_PROJECT}.sln\" " +
+                                     "/p:Configuration=Debug " +
+                                     "/p:DeployOnBuild=true " +
+                                     "/p:PublishDir=\"${env.WORKSPACE_PUBLISH_DIR}\""
+                    bat msbuildCmd
+                }
+            }
+        }
+
+        stage('Stop AppPool & Deploy') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = 'Stop'
+                    Import-Module WebAdministration
+
+                    $publishDir = "$env:WORKSPACE_PUBLISH_DIR"
+                    $deployRoot = "$env:DEPLOY_ROOT"
+                    $allowedExt = @('.exe','.dll','.pdb')
+
+                    # --- 1. Stop App Pool (safe) ---
+                    Write-Host "Stopping App Pool: $env:APP_POOL"
+                    $state = (Get-WebAppPoolState -Name $env:APP_POOL).Value
+                    if ($state -ne "Stopped") {
+                        Stop-WebAppPool -Name $env:APP_POOL -ErrorAction Stop
+                        Write-Host "✅ App Pool stopped."
+                    } else {
+                        Write-Host "⚠️ App Pool already stopped, skipping stop."
+                    }
+
+                    # --- 2. Copy only allowed files ---
+                    if (Test-Path $publishDir) {
+                        $files = Get-ChildItem -Path $publishDir -Recurse | Where-Object {
+                            -not $_.PSIsContainer -and $allowedExt -contains $_.Extension.ToLower()
+                        }
+
+                        foreach ($src in $files) {
+                            $relativePath = $src.FullName.Substring($publishDir.Length).TrimStart('\\')
+                            $dst = Join-Path $deployRoot $relativePath
+                            $dstDir = Split-Path $dst -Parent
+                            if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
+
+                            $retry = 5
+                            while ($retry -gt 0) {
+                                try {
+                                    Copy-Item -Path $src.FullName -Destination $dst -Force -ErrorAction Stop
+                                    Write-Host "Copied: $relativePath"
+                                    break
+                                } catch {
+                                    Write-Host "File locked, retrying in 2s..."
+                                    Start-Sleep -Seconds 2
+                                    $retry--
+                                }
+                            }
+                            if ($retry -eq 0) { Write-Host "❌ Failed to copy $relativePath after retries." }
+                        }
+                    } else {
+                        Write-Host "⚠️ Publish directory not found: $publishDir. Skipping deployment."
+                    }
+
+                    # --- 3. Restart App Pool with retries ---
+                    Write-Host "Starting App Pool: $env:APP_POOL"
+                    $retry = 5
+                    while ($retry -gt 0) {
+                        try {
+                            Start-WebAppPool -Name $env:APP_POOL -ErrorAction Stop
+                            $state = (Get-WebAppPoolState -Name $env:APP_POOL).Value
+                            if ($state -eq "Started") {
+                                Write-Host "✅ App Pool started successfully."
+                                break
+                            }
+                        } catch {
+                            Write-Host "⚠️ App Pool not ready, retrying in 5s... ($retry attempts left)"
+                            Start-Sleep -Seconds 5
+                            $retry--
+                        }
+                    }
+                    if ($retry -eq 0) {
+                        throw "❌ Failed to start App Pool $env:APP_POOL after multiple retries."
+                    }
+                '''
+            }
+        }
+
+        stage('Deployment summary') {
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+                    $allowedExt = @('.exe','.dll','.pdb')
+
+                    if (Test-Path "$env:DEPLOY_ROOT") {
+                        $files = Get-ChildItem -Path "$env:DEPLOY_ROOT" -Recurse | Where-Object {
+                            -not $_.PSIsContainer -and $allowedExt -contains $_.Extension.ToLower()
+                        }
+                        Write-Host "📂 Deployed folder: $env:DEPLOY_ROOT"
+                        Write-Host "✅ Files deployed here: $($files.Count)`n"
+                    } else {
+                        Write-Host "⚠️ Deployment folder missing: $env:DEPLOY_ROOT"
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ IIS deployment successful." }
+        failure { echo "❌ IIS deployment failed. Check console logs." }
+        always  { echo "ℹ️ Build complete." }
+    }
+}
