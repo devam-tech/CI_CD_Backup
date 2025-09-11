@@ -1,0 +1,142 @@
+pipeline {
+    agent { label 'built-in'}
+
+    environment {
+        REPO_URL      = 'https://github.com/MultiiconIdeotechnology/Bonton_API.git'
+        REPO_BRANCH   = 'uat'
+        GIT_CRED      = 'MM_PAT'
+
+        DOTNET_PROJECT = "BontonAPI"
+        PUBLISH_DIR    = "${WORKSPACE}\\publish_output"
+        DEPLOY_ROOT    = "D:\\Website\\Bonton\\uat.api.bontonholidays.com"
+        APP_POOL_NAME  = "uat.api.bontonholidays.com"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo "🔄 Checking out branch '${env.REPO_BRANCH}' from repo '${env.REPO_URL}'..."
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${env.REPO_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${env.REPO_URL}", credentialsId: "${env.GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Build & Publish') {
+            steps {
+                echo '🛠 Building and publishing project...'
+
+                echo '🔧 Restoring NuGet packages...'
+                bat "dotnet restore ${env.DOTNET_PROJECT}"
+
+                echo '🛠 Building project in Debug mode...'
+                bat "dotnet build ${env.DOTNET_PROJECT} -c Debug"
+
+                echo '📦 Publishing project to output folder...'
+                bat "dotnet publish ${env.DOTNET_PROJECT} -c Debug -o ${env.PUBLISH_DIR}"
+            }
+        }
+
+        stage('Deploy to IIS') {
+            steps {
+                echo '🚀 Deploying to IIS...'
+                powershell """
+try {
+    \$sleepSeconds = 7   # default wait time (adjust if needed)
+    
+    # Stop App Pool (ignore if already stopped)
+    Write-Host "🛑 Stopping App Pool: ${env.APP_POOL_NAME}"
+    try {
+        Stop-WebAppPool -Name '${env.APP_POOL_NAME}'
+    } catch [System.InvalidOperationException] {
+        Write-Warning "⚠ App Pool already stopped, continuing..."
+    }
+
+    # Wait until App Pool is fully stopped
+    \$stopRetries = 10
+    while (\$stopRetries -gt 0) {
+        \$state = (Get-WebAppPoolState -Name '${env.APP_POOL_NAME}').Value
+        if (\$state -eq 'Stopped') {
+            Write-Host "✅ App Pool is now Stopped."
+            break
+        } else {
+            Write-Host "⏳ Waiting for App Pool to stop... (\$stopRetries retries left)"
+            Start-Sleep -Seconds \$sleepSeconds
+            \$stopRetries--
+        }
+        if (\$stopRetries -eq 0) {
+            Write-Error "❌ App Pool did not stop after multiple attempts."
+            exit 1
+        }
+    }
+
+    # App offline
+    Write-Host "⏸ App offline..."
+    Set-Content -Path '${env.DEPLOY_ROOT}\\app_offline.htm' -Value '<html>App is being updated, please wait...</html>'
+
+    # Copy files with minimal output
+    Write-Host "📂 Copying files..."
+    robocopy '${env.PUBLISH_DIR}' '${env.DEPLOY_ROOT}' /E /XO /XF web.config *.json /XD Content Logs /NJH /NJS /NP /NS /NC
+    \$rc = \$LASTEXITCODE
+
+    # Bring app online
+    Remove-Item '${env.DEPLOY_ROOT}\\app_offline.htm' -Force
+    Write-Host "✅ App online."
+
+    # Start App Pool with retry + state check
+    Write-Host "🔄 Starting App Pool: ${env.APP_POOL_NAME}"
+    \$startRetries = 10
+    while (\$startRetries -gt 0) {
+        try {
+            Start-WebAppPool -Name '${env.APP_POOL_NAME}'
+            Start-Sleep -Seconds \$sleepSeconds
+            \$state = (Get-WebAppPoolState -Name '${env.APP_POOL_NAME}').Value
+            if (\$state -eq 'Started') {
+                Write-Host "✅ App Pool started successfully."
+                break
+            } else {
+                Write-Warning "⚠ App Pool not yet started. Retrying... (\$startRetries retries left)"
+            }
+        } catch {
+            Write-Warning "⚠ Could not start App Pool. Retrying... (\$startRetries retries left)"
+        }
+        \$startRetries--
+        Start-Sleep -Seconds \$sleepSeconds
+        if (\$startRetries -eq 0) {
+            Write-Error "❌ Failed to start App Pool after multiple attempts."
+            exit 1
+        }
+    }
+
+    # Robocopy exit code handling (0-7 success, 8+ failure)
+    if (\$rc -ge 0 -and \$rc -le 7) {
+        Write-Host "🎉 Deployment completed successfully! (Robocopy Exit Code: \$rc)"
+        exit 0
+    } else {
+        Write-Error "❌ Deployment failed! (Robocopy Exit Code: \$rc)"
+        exit 1
+    }
+
+} catch {
+    Write-Error "❌ Deployment failed: \$_.Exception.Message"
+    exit 1
+}
+"""
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Pipeline completed successfully!'
+        }
+        failure {
+            echo '❌ Pipeline failed. Check logs for details.'
+        }
+        always {
+            echo '📝 Pipeline finished.'
+        }
+    }
+}
