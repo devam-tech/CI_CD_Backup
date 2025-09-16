@@ -1,0 +1,102 @@
+pipeline {
+    agent { label 'built-in' }
+
+    tools { 
+        nodejs 'node19'
+    }
+
+    environment {
+        REPO_URL     = 'https://github.com/MultiiconIdeotechnology/MM_Web_Backoffice.git'
+        REPO_BRANCH  = 'uat_global'
+        GIT_CRED     = 'MM_PAT'
+
+        DEPLOY_ROOT  = 'D:\\Website\\MarketMaya\\developer.backoffice.marketmaya.com'
+        APP_POOL     = 'developer.backoffice.marketmaya.com'
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                git branch: env.REPO_BRANCH,
+                    url: env.REPO_URL,
+                    credentialsId: env.GIT_CRED
+            }
+        }
+
+        stage('Check Node & NPM') {
+            steps {
+                script {
+                    bat 'node -v'
+                    bat 'npm -v'
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                bat 'npm install --legacy-peer-deps'
+            }
+        }
+
+        stage('Build Angular (Developer)') {
+            steps {
+                script {
+                    echo "⚡ Running Angular build..."
+                    bat '''
+                        set NODE_OPTIONS=--openssl-legacy-provider
+                        npx ng build fuse --configuration developer
+                    '''
+                    bat '''
+                        if not exist dist\\fuse (
+                            echo ❌ Build failed: dist/fuse not found.
+                            exit 1
+                        )
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to IIS') {
+            steps {
+                script {
+                    echo "🚀 Deploying to IIS..."
+                    powershell """
+                        Write-Host '🛑 Stopping App Pool: ${env.APP_POOL}'
+                        Import-Module WebAdministration
+                        Stop-WebAppPool -Name "${env.APP_POOL}"
+
+                        Write-Host '📂 Deploying files...'
+                        Remove-Item -Recurse -Force "${env.DEPLOY_ROOT}\\*" -ErrorAction SilentlyContinue
+                        Copy-Item -Recurse -Force "dist\\fuse\\*" "${env.DEPLOY_ROOT}\\"
+
+                        Write-Host '▶️ Starting App Pool: ${env.APP_POOL}'
+                        Start-WebAppPool -Name "${env.APP_POOL}"
+                    """
+                }
+            }
+        }
+
+        stage('Deployment Summary') {
+            steps {
+                script {
+                    echo "📦 Deployment Summary:"
+                    echo "   ➤ Branch: ${env.REPO_BRANCH}"
+                    echo "   ➤ Deployed to: ${env.DEPLOY_ROOT}"
+                    echo "   ➤ IIS App Pool: ${env.APP_POOL}"
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Pipeline completed successfully and deployed to IIS!'
+        }
+        failure {
+            echo '❌ Pipeline failed during build or deployment!'
+        }
+        always {
+            echo '♻️ Pipeline execution finished.'
+        }
+    }
+}
