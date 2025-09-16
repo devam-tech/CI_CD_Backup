@@ -1,0 +1,166 @@
+pipeline {
+    agent { label 'built-in' }
+
+    environment {
+        REPO_URL        = 'https://github.com/MultiiconIdeotechnology/MM_Data_Grabber.git'
+        REPO_BRANCH     = 'uat_india'
+        GIT_CRED        = 'MM_PAT'
+
+        DEPLOY_ROOT     = 'D:\\Website\\MarketMaya\\Win Services\\MarketMayaDataGrabber'
+        SOLUTION_NAME   = 'MarketMayaDataGrabber'
+        SERVICE_NAME    = 'MarketMayaDataGrabber'
+        PROCESS_NAME    = 'MarketMayaDataGrabber'
+        WORKSPACE_PUBLISH_DIR = "${env.WORKSPACE}\\MarketMayaDataGrabber\\bin\\Debug\\"
+    }
+
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                  branches: [[name: "*/${REPO_BRANCH}"]],
+                  userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Sanity checks') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    if (-not (Test-Path "$env:DEPLOY_ROOT")) {
+                        New-Item -ItemType Directory -Force -Path "$env:DEPLOY_ROOT" | Out-Null
+                    }
+                    if (-not (Test-Path "$env:WORKSPACE_PUBLISH_DIR")) {
+                        New-Item -ItemType Directory -Force -Path "$env:WORKSPACE_PUBLISH_DIR" | Out-Null
+                    }
+                    git --version | Out-Null
+                    Write-Host "Current HEAD: $(git rev-parse HEAD).Trim()"
+                '''
+            }
+        }
+
+        stage('Build & Publish') {
+            steps {
+                bat "D:\\devam\\nuget.exe restore ${SOLUTION_NAME}"
+
+                script {
+                    def msbuildCmd = "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe\" " +
+                                     "\"${SOLUTION_NAME}\" " +
+                                     "/p:Configuration=Debug " +
+                                     "/p:DeployOnBuild=true " +
+                                     "/p:PublishDir=\"${env.WORKSPACE_PUBLISH_DIR}\""
+                    bat msbuildCmd
+                }
+            }
+        }
+
+        stage('Service & Deployment Tasks') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = 'Stop'
+                    $publishDir = "$env:WORKSPACE_PUBLISH_DIR"
+                    $deployRoot = "$env:DEPLOY_ROOT"
+                    $svcName    = "$env:SERVICE_NAME"
+                    $procName   = "$env:PROCESS_NAME"
+                    $allowedExt = @('.exe','.dll','.pdb')
+
+                    # 1) Stop the scheduler service (if present)
+                    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                    if ($svc -and $svc.Status -ne 'Stopped') {
+                        Write-Host "Stopping service: $svcName"
+                        Stop-Service -Name $svcName -Force
+                        Start-Sleep -Seconds 2
+                    } else {
+                        Write-Host "Service $svcName already stopped or not installed."
+                    }
+
+                    # 2) Copy allowed files from publish -> deploy
+                    if (Test-Path $publishDir) {
+                        $files = Get-ChildItem -Path $publishDir -Recurse | Where-Object {
+                            -not $_.PSIsContainer -and $allowedExt -contains $_.Extension.ToLower()
+                        }
+
+                        foreach ($src in $files) {
+                            $relativePath = $src.FullName.Substring($publishDir.Length).TrimStart('\\')
+                            $dst = Join-Path $deployRoot $relativePath
+                            $dstDir = Split-Path $dst -Parent
+                            if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
+
+                            $retry = 5
+                            while ($retry -gt 0) {
+                                try {
+                                    Copy-Item -Path $src.FullName -Destination $dst -Force -ErrorAction Stop
+                                    Write-Host "Copied: $relativePath"
+                                    break
+                                } catch {
+                                    Write-Host "File locked, retrying in 2s..."
+                                    Start-Sleep -Seconds 2
+                                    $retry--
+                                }
+                            }
+                            if ($retry -eq 0) { Write-Host "❌ Failed to copy $relativePath after retries." }
+                        }
+                    } else {
+                        Write-Host "⚠️ Publish directory not found: $publishDir. Skipping deployment."
+                    }
+
+                    # 3) Start service & verify running
+                    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                    if (-not $svc) { Write-Host "❌ $svcName not installed"; exit 1 }
+
+                    $maxWait = 20
+                    $elapsed = 0
+                    while ($svc.Status -ne 'Running' -and $elapsed -lt $maxWait) {
+                        Start-Service -Name $svcName -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds 2
+                        $elapsed += 2
+                        $svc.Refresh()
+                    }
+
+                    if ($svc.Status -eq 'Running') {
+                        $proc = Get-Process -Name $procName -ErrorAction SilentlyContinue
+                        if ($proc) {
+                            Write-Host "✅ Health check passed for $svcName (process $procName running)."
+                        } else {
+                            Write-Host "⚠️ $svcName is running but process $procName not found."
+                        }
+                    } else {
+                        Write-Host "❌ $svcName failed to start within ${maxWait}s."
+                        exit 1
+                    }
+                '''
+            }
+        }
+
+        stage('Deployment summary') {
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+                    $allowedExt = @('.exe','.dll','.pdb')
+                    $deployDir = "$env:DEPLOY_ROOT"
+                    if (Test-Path $deployDir) {
+                        $files = Get-ChildItem -Path $deployDir -Recurse | Where-Object {
+                            -not $_.PSIsContainer -and $allowedExt -contains $_.Extension.ToLower()
+                        }
+                        Write-Host "📂 Deployment folder: $deployDir"
+                        Write-Host "✅ Files deployed here (allowed types): $($files.Count)`n"
+                    } else {
+                        Write-Host "⚠️ Deployment folder missing: $deployDir"
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ UAT Global MMScheduler deployment successful." }
+        failure { echo "❌ UAT Global MMScheduler deployment failed. Check console logs." }
+        always  { echo "ℹ️ Build complete." }
+    }
+}

@@ -1,0 +1,138 @@
+pipeline {
+    agent { label 'built-in' }
+
+    environment {
+        REPO_URL    = 'https://github.com/MultiiconIdeotechnology/MM_Web_Client_Terminal.git'
+        REPO_BRANCH = 'uat_india'
+        GIT_CRED    = 'MM_PAT'
+
+        DEPLOY_ROOT = 'D:\\Website\\MarketMaya\\uat.terminal.marketmaya.com'
+        APP_POOL    = 'uat.terminal.marketmaya.com'
+        EXCLUDE_FILE = 'web.config'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${REPO_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Build Angular') {
+            steps {
+                powershell '''
+                    Write-Host "📦 Installing npm dependencies..."
+                    npm install
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "❌ npm install failed."
+                    } else {
+                        Write-Host "✅ npm install completed successfully."
+                    }
+
+                    Write-Host "⚡ Running Angular build (project: fuse, config: uat)..."
+                    npx ng build fuse --configuration=uat
+
+                    if (!(Test-Path "$env:WORKSPACE\\dist\\fuse")) {
+                        throw "❌ Build failed. dist/fuse folder not found."
+                    } else {
+                        $count = (Get-ChildItem "$env:WORKSPACE\\dist\\fuse" -Recurse -File).Count
+                        Write-Host "✅ Build completed. dist/fuse folder created with $count files."
+                    }
+                '''
+            }
+        }
+
+        stage('Deploy to IIS') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    Import-Module WebAdministration
+
+                    $publishDir   = "$env:WORKSPACE\\dist\\fuse"
+                    $deployRoot   = "$env:DEPLOY_ROOT"
+                    $appPool      = "$env:APP_POOL"
+                    $sleepSeconds = 7   # adjust sleep time if needed
+                    $maxStopTries = 10
+                    $maxStartTries = 5
+
+                    if (-not (Test-Path $publishDir)) { throw "❌ Publish folder not found: $publishDir" }
+
+                    Write-Host "🛑 Stopping App Pool: $appPool"
+                    try {
+                        $state = (Get-WebAppPoolState -Name $appPool).Value
+                        if ($state -ne 'Stopped') { Stop-WebAppPool -Name $appPool -ErrorAction Stop }
+
+                        $stopped = $false
+                        for ($i=1; $i -le $maxStopTries; $i++) {
+                            $state = (Get-WebAppPoolState -Name $appPool).Value
+                            if ($state -eq 'Stopped') {
+                                Write-Host "✅ App Pool stopped after $i attempt(s)."
+                                $stopped = $true
+                                break
+                            } else {
+                                Write-Host "⏳ Waiting for App Pool to stop (Attempt $i/$maxStopTries)... Current state: $state"
+                                Start-Sleep -Seconds $sleepSeconds
+                            }
+                        }
+                        if (-not $stopped) { throw "❌ Failed to stop App Pool after $maxStopTries attempts." }
+                    } catch {
+                        Write-Host "⚠️ Could not stop App Pool (might already be stopped): $_"
+                    }
+
+                    Write-Host "📂 Deploying files from $publishDir to $deployRoot (excluding $env:EXCLUDE_FILE)"
+                    robocopy "$publishDir" "$deployRoot" /E /XF "$env:EXCLUDE_FILE" /NFL /NDL /NP /NJH /NJS
+                    $rc = $LASTEXITCODE
+                    Write-Host "Robocopy returned exit code: $rc"
+
+                    if ($rc -ge 8) {
+                        throw "❌ Robocopy failed with exit code $rc"
+                    } else {
+                        Write-Host "✅ Deployment success. Robocopy exit code: $rc"
+                        $global:LASTEXITCODE = 0
+                    }
+
+                    Write-Host "🚀 Starting App Pool: $appPool"
+                    $started = $false
+                    for ($i=1; $i -le $maxStartTries; $i++) {
+                        Start-WebAppPool -Name $appPool -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds $sleepSeconds
+                        $state = (Get-WebAppPoolState -Name $appPool).Value
+                        if ($state -eq 'Started') {
+                            Write-Host "✅ App Pool started successfully after $i attempt(s)."
+                            $started = $true
+                            break
+                        } else {
+                            Write-Host "⏳ App Pool not started yet (Attempt $i/$maxStartTries)... Current state: $state"
+                        }
+                    }
+                    if (-not $started) { throw "❌ Failed to start App Pool after $maxStartTries attempts." }
+
+                    Write-Host "🎉 Deployment completed successfully."
+                '''
+            }
+        }
+
+        stage('Deployment Summary') {
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+                    if (Test-Path "$env:DEPLOY_ROOT") {
+                        $files = Get-ChildItem -Path "$env:DEPLOY_ROOT" -Recurse -File
+                        Write-Host ("Total files deployed (excluding $env:EXCLUDE_FILE): {0}" -f $files.Count)
+                    } else {
+                        Write-Host "❌ Deployment folder missing!"
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ Angular IIS deployment successful." }
+        failure { echo "❌ Deployment failed. Check console logs for details." }
+        always  { echo "ℹ️ Pipeline execution complete." }
+    }
+}
