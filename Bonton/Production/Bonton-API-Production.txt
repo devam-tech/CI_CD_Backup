@@ -1,0 +1,167 @@
+pipeline {
+    agent none
+
+    environment {
+        REPO_URL      = 'https://github.com/MultiiconIdeotechnology/Bonton_API.git'
+        REPO_BRANCH   = 'Development'
+        GIT_CRED      = 'MM_PAT'
+
+        DOTNET_PROJECT = "BontonAPI"
+        PUBLISH_DIR    = "${WORKSPACE}\\publish_output"
+        DEPLOY_ROOT    = "D:\\jenkins-agent\\Testing\\Bonton\\Bonton V2\\api.bontontech.com"
+        APP_POOL_NAME  = "api.bontontech.com"
+		ALLOWED_JSON   = 'BontonAPI.deps'
+    }
+
+    stages {
+
+        stage('Build') {
+            agent { label 'built-in' }
+
+            stages {
+                stage('Checkout') {
+                    steps {
+                        echo "🔄 Checking out branch '${env.REPO_BRANCH}' from repo '${env.REPO_URL}'..."
+                        checkout([$class: 'GitSCM',
+                            branches: [[name: "*/${env.REPO_BRANCH}"]],
+                            userRemoteConfigs: [[url: "${env.REPO_URL}", credentialsId: "${env.GIT_CRED}"]]
+                        ])
+                    }
+                }
+
+                stage('Build & Publish') {
+                    steps {
+                        echo '🛠 Building and publishing project...'
+
+                        echo '🔧 Restoring NuGet packages...'
+                        bat "dotnet restore ${env.DOTNET_PROJECT}"
+
+                        echo 'Building project in Release mode...'
+                        bat "dotnet build ${env.DOTNET_PROJECT} -c Release"
+
+                        echo '📦 Publishing project to output folder...'
+                        bat "dotnet publish ${env.DOTNET_PROJECT} -c Release -o ${env.PUBLISH_DIR}"
+                    }
+                }
+
+                stage('Archive & Stash Artifacts') {
+                    steps {
+                        echo '📦 Archiving and stashing publish_output folder...'
+                        archiveArtifacts artifacts: 'publish_output/**', fingerprint: true
+                        stash name: 'publish_output', includes: 'publish_output/**'
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            agent { label 'aws-marketmaya-india-windows' }
+
+            steps {
+                echo '🚀 Deploying to IIS from stashed artifacts...'
+
+                // Retrieve stashed artifacts
+                unstash 'publish_output'
+
+                powershell """
+try {
+    # Stop App Pool with retry logic
+    Write-Host "🛑 Stopping App Pool: ${env.APP_POOL_NAME}"
+    \$retries = 10
+    while (\$retries -gt 0) {
+        try {
+            Stop-WebAppPool -Name '${env.APP_POOL_NAME}' -ErrorAction Stop
+            Write-Host "✅ App Pool stopped."
+            break
+        } catch {
+            Write-Warning "⚠ Could not stop App Pool. Retrying in 7 seconds... (Remaining: \$retries)"
+            Start-Sleep -Seconds 7
+            \$retries--
+        }
+    }
+
+    # App offline
+    Write-Host "⏸ App offline..."
+    Set-Content -Path '${env.DEPLOY_ROOT}\\app_offline.html' -Value '<html>App is being updated, please wait...</html>'
+
+    # Copy new files from artifact folder (safe, no deletion)
+    Write-Host "📂 Copying/updating files from publish_output to ${env.DEPLOY_ROOT}..."
+    robocopy '${env.WORKSPACE}\\publish_output' '${env.DEPLOY_ROOT}' /E /XO /XF web.config *.json /NFL /NDL /NP
+	robocopy "${env.WORKSPACE}\\${env.PUBLISH_DIR}" "${env.DEPLOY_ROOT}" "${env.ALLOWED_JSON}" /XO /NFL /NDL /NP
+    \$rc = \$LASTEXITCODE
+    Write-Host "🔹 Robocopy Exit Code: \$rc"
+
+    # Remove app_offline.html
+    Remove-Item '${env.DEPLOY_ROOT}\\app_offline.html' -Force -ErrorAction SilentlyContinue
+    Write-Host "✅ App online."
+
+    # Start App Pool with retry logic
+    Write-Host "🔄 Starting App Pool: ${env.APP_POOL_NAME}"
+    \$retries = 10
+    while (\$retries -gt 0) {
+        try {
+            Start-WebAppPool -Name '${env.APP_POOL_NAME}' -ErrorAction Stop
+            Write-Host "✅ App Pool started successfully."
+            break
+        } catch {
+            Write-Warning "⚠ Could not start App Pool. Retrying in 7 seconds... (Remaining: \$retries)"
+            Start-Sleep -Seconds 7
+            \$retries--
+        }
+    }
+
+    # Robocopy exit code handling
+    if (\$rc -ge 0 -and \$rc -le 7) {
+        Write-Host "🎉 Deployment completed successfully! (Robocopy Exit Code: \$rc)"
+        exit 0
+    } elseif (\$rc -gt 7 -and \$rc -lt 16) {
+        Write-Warning "⚠ Deployment completed with warnings. (Robocopy Exit Code: \$rc)"
+        exit 0
+    } else {
+        Write-Error "❌ Deployment failed! (Robocopy Exit Code: \$rc)"
+        exit 1
+    }
+
+} catch {
+    Write-Error "❌ Deployment failed: \$_.Exception.Message"
+    exit 1
+}
+"""
+            }
+        }
+
+        stage('Rollback') {
+            when {
+                expression { currentBuild.currentResult == "FAILURE" }
+            }
+            steps {
+                echo '🔄 Rollback triggered. Ensuring IIS App Pool is running...'
+                powershell """
+try {
+    if ((Get-WebAppPoolState -Name '${env.APP_POOL_NAME}').Value -ne 'Started') {
+        Write-Host "⚠ App Pool is not running. Attempting to start..."
+        Start-WebAppPool -Name '${env.APP_POOL_NAME}'
+        Write-Host "✅ App Pool restarted successfully."
+    } else {
+        Write-Host "ℹ App Pool is already running. No action needed."
+    }
+} catch {
+    Write-Error "❌ Rollback failed: \$_.Exception.Message"
+}
+"""
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Pipeline completed successfully!'
+        }
+        failure {
+            echo '❌ Pipeline failed. Check logs for details.'
+        }
+        always {
+            echo '📝 Pipeline finished.'
+        }
+    }
+}
