@@ -1,0 +1,147 @@
+pipeline {
+    agent none
+
+    environment {
+        REPO_URL     = 'https://github.com/MultiiconIdeotechnology/MM_Web_New_BO.git'
+        REPO_BRANCH  = 'uat_india'
+        GIT_CRED     = 'MM_PAT'
+
+        DEPLOY_ROOT  = 'D:\\jenkins-agent\\Testing\\MarketMaya\\NewBO'
+        APP_POOL     = 'todoapi.multiicon.in'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            agent { label 'built-in' }
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${REPO_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Build') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    Write-Host "📦 Installing npm dependencies..."
+                    npm install --legacy-peer-deps
+                    if ($LASTEXITCODE -ne 0) { throw "❌ npm install failed." }
+
+                    Write-Host "⚡ Running Angular build (project: fuse, config: production)..."
+                    npx ng build fuse --configuration=production
+                '''
+            }
+        }
+
+        stage('Artifact Create') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    if (Test-Path "$env:WORKSPACE\\dist\\fuse\\browser") {
+                        $buildPath = "$env:WORKSPACE\\dist\\fuse\\browser"
+                    } elseif (Test-Path "$env:WORKSPACE\\dist\\fuse") {
+                        $buildPath = "$env:WORKSPACE\\dist\\fuse"
+                    } else {
+                        throw "❌ Build failed. dist/fuse (or dist/fuse/browser) folder not found."
+                    }
+
+                    $publishOutput = "$env:WORKSPACE\\publish_output"
+                    if (Test-Path $publishOutput) { Remove-Item $publishOutput -Recurse -Force }
+                    New-Item -ItemType Directory -Path $publishOutput | Out-Null
+
+                    Copy-Item -Path "$buildPath\\*" -Destination $publishOutput -Recurse -Force
+
+                    $filesCount = (Get-ChildItem -Path $publishOutput -Recurse -File).Count
+                    Write-Host "📂 Total files in publish_output: $filesCount"
+                '''
+
+                archiveArtifacts artifacts: 'publish_output/**', fingerprint: true, onlyIfSuccessful: true
+                stash name: 'artifact_bundle', includes: 'publish_output/**'
+            }
+        }
+
+        stage('Deploy') {
+            agent { label 'aws-marketmaya-india-windows' }
+            steps {
+                unstash 'artifact_bundle'
+
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    Import-Module WebAdministration
+
+                    $publishDir = "$env:WORKSPACE\\publish_output"
+                    $deployRoot = "$env:DEPLOY_ROOT"
+                    $appPool    = "$env:APP_POOL"
+                    $maxRetries = 10
+                    $retryDelay = 5
+
+                    if (-not (Test-Path $publishDir)) { throw "❌ Publish folder not found: $publishDir" }
+
+                    function Retry-AppPoolAction($actionScript, $actionName) {
+                        for ($i = 1; $i -le $maxRetries; $i++) {
+                            try {
+                                & $actionScript
+                                Write-Host "✅ $actionName succeeded on attempt ${i}"
+                                return
+                            } catch {
+                                Write-Warning "⚠ Attempt ${i}: $actionName failed. Retrying in ${retryDelay} seconds..."
+                                Start-Sleep -Seconds $retryDelay
+                            }
+                        }
+                        throw "❌ $actionName failed after $maxRetries attempts."
+                    }
+
+                    # Stop App Pool if running
+                    try { $state = (Get-WebAppPoolState -Name $appPool).Value } catch { $state = $null }
+                    if ($state -eq "Stopped") {
+                        Write-Host "ℹ️ App Pool '$appPool' already stopped."
+                    } else {
+                        Retry-AppPoolAction { Stop-WebAppPool -Name $appPool -ErrorAction Stop } "Stopping App Pool $appPool"
+                    }
+
+                    # Deploy files (robocopy)
+                    robocopy "$publishDir" "$deployRoot" /E /XO /XF web.config /NFL /NDL /NP
+                    $rc = $LASTEXITCODE
+
+                    if ($rc -ge 0 -and $rc -le 7) {
+                        Write-Host "✅ Deployment successful! (Exit $rc)"
+                        $global:LASTEXITCODE = 0
+                    } elseif ($rc -gt 7 -and $rc -lt 16) {
+                        Write-Warning "⚠ Deployment completed with warnings. (Exit $rc)"
+                        $global:LASTEXITCODE = 0
+                    } else {
+                        Write-Error "❌ Deployment failed! (Exit $rc)"
+                        exit 1
+                    }
+
+                    # Start App Pool with retry loop
+                    Retry-AppPoolAction { Start-WebAppPool -Name $appPool -ErrorAction Stop } "Starting App Pool $appPool"
+                '''
+            }
+        }
+
+        stage('Deployment Summary') {
+            agent { label 'aws-marketmaya-india-windows' }
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+                    if (Test-Path "$env:DEPLOY_ROOT") {
+                        $files = Get-ChildItem -Path "$env:DEPLOY_ROOT" -Recurse -File
+                        Write-Host ("Total files deployed (excluding web.config & *.json): {0}" -f $files.Count)
+                    } else {
+                        Write-Host "❌ Deployment folder missing!"
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ IIS deployment successful." }
+        failure { echo "❌ Deployment failed. Check console logs for details." }
+        always  { echo "ℹ️ Pipeline execution complete." }
+    }
+}
