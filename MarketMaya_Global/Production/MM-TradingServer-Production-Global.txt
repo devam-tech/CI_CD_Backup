@@ -1,0 +1,196 @@
+pipeline {
+    agent none
+
+    environment {
+        REPO_URL        = 'https://github.com/MultiiconIdeotechnology/MM_Trading_Server.git'
+        REPO_BRANCH     = 'main'
+        GIT_CRED        = 'MM_PAT'
+
+        DEPLOY_ROOT     = 'C:\\jenkins-agent\\Testing\\MarketMaya\\Win Services\\Trading Server'
+        DOTNET_PROJECT  = "MarketMayaTradingServer"
+        WORKSPACE_PUBLISH_DIR = "${env.WORKSPACE}\\MarketMayaTradingServer\\bin\\Release\\"
+        PUBLISH_OUTPUT_DIR    = "${env.WORKSPACE}\\publish_output"
+    }
+
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+    }
+
+    stages {
+
+        stage('Checkout') {
+            agent { label 'built-in' }
+            steps {
+                checkout([$class: 'GitSCM',
+                  branches: [[name: "*/${REPO_BRANCH}"]],
+                  userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Sanity checks') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    if (-not (Test-Path "$env:DEPLOY_ROOT")) { New-Item -ItemType Directory -Force -Path "$env:DEPLOY_ROOT" | Out-Null }
+                    git --version | Out-Null
+                    Write-Host "Current HEAD: $(git rev-parse HEAD).Trim()"
+                '''
+            }
+        }
+
+        stage('Build & Publish') {
+            agent { label 'built-in' }
+            steps {
+                bat "D:\\devam\\nuget.exe restore ${DOTNET_PROJECT}.sln"
+
+                powershell '''
+                    if (-not (Test-Path "$env:WORKSPACE_PUBLISH_DIR")) {
+                        New-Item -ItemType Directory -Force -Path "$env:WORKSPACE_PUBLISH_DIR" | Out-Null
+                    }
+                '''
+
+                script {
+                    def msbuildCmd = "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe\" " +
+                                     "\"${DOTNET_PROJECT}.sln\" " +
+                                     "/p:Configuration=Release " +
+                                     "/p:DeployOnBuild=true " +
+                                     "/p:PublishDir=\"${env.WORKSPACE_PUBLISH_DIR}\""
+                    bat msbuildCmd
+                }
+
+                powershell '''
+                    if (Test-Path "$env:PUBLISH_OUTPUT_DIR") { Remove-Item -Recurse -Force "$env:PUBLISH_OUTPUT_DIR" }
+                    New-Item -ItemType Directory -Force -Path "$env:PUBLISH_OUTPUT_DIR" | Out-Null
+                    Copy-Item -Path "$env:WORKSPACE_PUBLISH_DIR\\*" -Destination "$env:PUBLISH_OUTPUT_DIR" -Recurse -Force
+                '''
+
+                stash includes: 'publish_output/**', name: 'build_artifacts'
+            }
+        }
+
+        stage('Services & Deployment Tasks') {
+            agent { label 'aws-marketmaya-global-window' }
+            steps {
+                unstash 'build_artifacts'
+
+                powershell '''
+                    $ErrorActionPreference = 'Stop'
+
+                    $publishDir = "$env:WORKSPACE\\publish_output"
+                    $deployRoot = "$env:DEPLOY_ROOT"
+                    $allowedExt = @('.exe','.dll','.pdb')
+
+                    if (-not (Test-Path $publishDir)) {
+                        Write-Host "Publish directory not found: $publishDir"
+                        exit 1
+                    }
+
+                    $files = Get-ChildItem -Path $publishDir -Recurse | Where-Object {
+                        -not $_.PSIsContainer -and $allowedExt -contains $_.Extension.ToLower()
+                    }
+
+                    for ($i = 0; $i -le 8; $i++) {
+                        $svcName = "MarketMayaTradingServerLevel$i"
+                        $deployDir = Join-Path $deployRoot "Level $i"
+
+                        Write-Host "=== Processing $svcName ==="
+
+                        # Stop service
+                        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                        if ($svc -and $svc.Status -ne 'Stopped') {
+                            Write-Host "Stopping service: $svcName"
+                            Stop-Service -Name $svcName -Force
+                            for ($j=0; $j -lt 5; $j++) {
+                                Start-Sleep -Seconds 5
+                                if (-not (Get-Process -Name "MarketMayaTradingServer" -ErrorAction SilentlyContinue)) { break }
+                            }
+                        } else {
+                            Write-Host "Service $svcName already stopped or not installed."
+                        }
+
+                        # Copy files
+                        if (-not (Test-Path $deployDir)) { New-Item -ItemType Directory -Force -Path $deployDir | Out-Null }
+
+                        foreach ($src in $files) {
+                            $relativePath = $src.FullName.Substring($publishDir.Length).TrimStart('\\')
+                            $dst = Join-Path $deployDir $relativePath
+                            $dstDir = Split-Path $dst -Parent
+                            if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
+
+                            $retry = 5
+                            while ($retry -gt 0) {
+                                try {
+                                    Copy-Item -Path $src.FullName -Destination $dst -Force -ErrorAction Stop
+                                    Write-Host "[$svcName] Copied: $relativePath"
+                                    break
+                                } catch {
+                                    Write-Host "File locked, retrying in 5s..."
+                                    Start-Sleep -Seconds 5
+                                    $retry--
+                                }
+                            }
+                            if ($retry -eq 0) { Write-Host "Failed to copy $relativePath after retries." }
+                        }
+
+                        # Restart service + health check
+                        $maxRetries = 7
+                        for ($r=1; $r -le $maxRetries; $r++) {
+                            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                            if ($svc.Status -eq 'Running') { break }
+
+                            Write-Host "[$r/$maxRetries] Starting service: $svcName"
+                            Start-Service -Name $svcName -ErrorAction SilentlyContinue
+                            Start-Sleep -Seconds 5
+                        }
+
+                        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                        if (-not $svc) { Write-Host "$svcName not installed"; exit 1 }
+                        if ($svc.Status -ne 'Running') { Write-Host "$svcName failed to run"; exit 1 }
+
+                        $proc = Get-Process -Name "MarketMayaTradingServer" -ErrorAction SilentlyContinue
+                        if ($proc) {
+                            Write-Host "Health check passed for $svcName (process running)."
+                        } else {
+                            Write-Host "Health check failed for $svcName."
+                            exit 1
+                        }
+
+                        Write-Host "=== Completed $svcName ===`n"
+                    }
+                '''
+            }
+        }
+
+        stage('Deployment summary') {
+            agent { label 'aws-marketmaya-global-window' }
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+                    $allowedExt = @('.exe','.dll','.pdb')
+                    for ($i = 0; $i -le 8; $i++) {
+                        $deployDir = Join-Path "$env:DEPLOY_ROOT" "Level $i"
+                        if (Test-Path $deployDir) {
+                            $files = Get-ChildItem -Path $deployDir -Recurse | Where-Object {
+                                -not $_.PSIsContainer -and $allowedExt -contains $_.Extension.ToLower()
+                            }
+                            Write-Host "Level $i deployment folder: $deployDir"
+                            Write-Host "Files deployed here: $($files.Count)`n"
+                        } else {
+                            Write-Host "Level $i folder missing: $deployDir"
+                        }
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "Deployment successful." }
+        failure { echo "Deployment failed. Check console logs." }
+        always  { echo "Build complete." }
+    }
+}
