@@ -1,0 +1,128 @@
+pipeline {
+    agent none
+
+    environment {
+        REPO_URL     = 'https://github.com/MultiiconIdeotechnology/MM_Web_Partner.git'
+        REPO_BRANCH  = 'main'
+        GIT_CRED     = 'MM_PAT'
+
+        DEPLOY_ROOT  = 'C:\\jenkins-agent\\Testing\\MarketMaya\\Partner'
+        EXCLUDE_FILE = 'web.config'
+
+        // Prepend Node and ensure PowerShell is on PATH
+        PATH = "C:\\Program Files\\nvm\\v16.20.2;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;${env.PATH}"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            agent { label 'built-in' }
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${REPO_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Build Angular') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    Write-Host "Using Node & npm version:"
+                    node -v
+                    npm -v
+
+                    Write-Host "Installing npm dependencies..."
+                    npm install --legacy-peer-deps
+                    if ($LASTEXITCODE -ne 0) { throw " npm install failed." }
+
+                    Write-Host "Running Angular build (config: production)..."
+                    npx ng build --configuration=production
+                    if ($LASTEXITCODE -ne 0) { throw "Angular build failed." }
+                '''
+            }
+        }
+
+        stage('Prepare Artifacts') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    # Detect build output folder
+                    $distFuse = Join-Path $env:WORKSPACE "dist\\fuse"
+                    $distBrowser = Join-Path $distFuse "browser"
+
+                    if (Test-Path $distBrowser) {
+                        Write-Host " Found dist/fuse/browser, using that as build output."
+                        $distPath = $distBrowser
+                    } elseif (Test-Path $distFuse) {
+                        Write-Host " Found dist/fuse, using that as build output."
+                        $distPath = $distFuse
+                    } else {
+                        throw " Angular build did not produce a dist folder. Checked: $distFuse and $distBrowser"
+                    }
+
+                    # Prepare publish_output folder
+                    $publishDir = Join-Path $env:WORKSPACE "publish_output"
+                    if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
+                    New-Item -ItemType Directory -Force -Path $publishDir
+
+                    # Copy build artifacts
+                    Copy-Item $distPath $publishDir -Recurse
+                    Write-Host "Artifacts copied to $publishDir"
+                '''
+                archiveArtifacts artifacts: 'publish_output/**', fingerprint: true
+                stash name: 'angular-artifacts', includes: 'publish_output/**'
+            }
+        }
+
+        stage('Deploy to IIS') {
+            agent { label 'aws-marketmaya-global-window' }
+            steps {
+                unstash 'angular-artifacts'
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+
+                    $publishDir = Join-Path $env:WORKSPACE "publish_output"
+                    $deployRoot = "$env:DEPLOY_ROOT"
+
+                    if (-not (Test-Path $publishDir)) { throw "Publish folder not found: $publishDir" }
+
+                    # Deploy files
+                    & "$env:WINDIR\\System32\\Robocopy.exe" "$env:WORKSPACE\\publish_output\\fuse" "$env:DEPLOY_ROOT" /E /XO /XF "$env:EXCLUDE_FILE" /NFL /NDL /NP
+                    $rc = $LASTEXITCODE
+
+                    if ($rc -ge 0 -and $rc -le 7) {
+                        Write-Host "Deployment completed successfully! (Robocopy Exit Code: $rc)"
+                    } elseif ($rc -gt 7 -and $rc -lt 16) {
+                        Write-Warning "Deployment completed with warnings. (Robocopy Exit Code: $rc)"
+                    } else {
+                        Write-Error "Deployment failed! (Robocopy Exit Code: $rc)"
+                    }
+					$global:LASTEXITCODE = 0
+                '''
+            }
+        }
+
+        stage('Deployment Summary') {
+            agent { label 'aws-marketmaya-global-window' }
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+                    if (Test-Path "$env:DEPLOY_ROOT") {
+                        $files = Get-ChildItem -Path "$env:DEPLOY_ROOT" -Recurse -File
+                        Write-Host ("Total files deployed (excluding web.config): {0}" -f $files.Count)
+                    } else {
+                        Write-Host "Deployment folder missing!"
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ Angular IIS deployment pipeline completed successfully." }
+        failure { echo "❌ Deployment failed. Check logs for details." }
+        always  { echo "ℹ️ Pipeline execution complete." }
+    }
+}

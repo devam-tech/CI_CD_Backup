@@ -1,0 +1,223 @@
+pipeline {
+    agent none
+
+    environment {
+        REPO_URL        = 'https://github.com/MultiiconIdeotechnology/MM_History_Data_Downloader.git'
+        REPO_BRANCH     = 'main'
+        GIT_CRED        = 'MM_PAT'
+
+        DEPLOY_ROOT     = 'C:\\jenkins-agent\\Testing\\MarketMaya\\Win Services\\HistoryDataDownloader'
+        DOTNET_PROJECT  = "HistoryDataDownloader"
+        SERVICE_NAME    = "HistoryDataDownloader"
+        PROCESS_NAME    = 'HistoryDataDownloader'
+        SOLUTION_NAME   = 'HistoryDataDownloader.sln'
+
+        ALLOWED_JSON    = 'HistoryDataDownloader.deps.json'
+    }
+
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+    }
+
+    stages {
+
+        stage('Build Stage') {
+            agent { label 'built-in' }
+
+            stages {
+                stage('Checkout') {
+                    steps {
+                        checkout([$class: 'GitSCM',
+                          branches: [[name: "*/${REPO_BRANCH}"]],
+                          userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                        ])
+                    }
+                }
+
+                stage('Sanity checks') {
+                    steps {
+                        powershell '''
+                            $ErrorActionPreference = "Stop"
+                            if (-not (Test-Path "$env:DEPLOY_ROOT")) {
+                                New-Item -ItemType Directory -Force -Path "$env:DEPLOY_ROOT" | Out-Null
+                            }
+                            git --version | Out-Null
+                            Write-Host "Current HEAD: $(git rev-parse HEAD).Trim()"
+                        '''
+                    }
+                }
+
+                stage('Build') {
+                    steps {
+                        script {
+                            // Compute build output dir dynamically to avoid null bug
+                            env.WORKSPACE_PUBLISH_DIR = "${env.WORKSPACE}\\${DOTNET_PROJECT}\\bin\\Release\\"
+                        }
+
+                        bat "D:\\devam\\nuget.exe restore ${SOLUTION_NAME}"
+
+                        script {
+                            def msbuildCmd = "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\MSBuild\\Current\\Bin\\MSBuild.exe\" " +
+                                             "\"${SOLUTION_NAME}\" " +
+                                             "/p:Configuration=Release"
+                            bat msbuildCmd
+                        }
+                    }
+                }
+
+                stage('Verify Build Output') {
+                    steps {
+                        powershell '''
+                            Write-Host "Checking build output at: $env:WORKSPACE_PUBLISH_DIR"
+                            if (Test-Path $env:WORKSPACE_PUBLISH_DIR) {
+                                Get-ChildItem -Path $env:WORKSPACE_PUBLISH_DIR -Recurse | ForEach-Object {
+                                    Write-Host " - $($_.FullName)"
+                                }
+                            } else {
+                                Write-Host " Build output folder not found: $env:WORKSPACE_PUBLISH_DIR"
+                            }
+                        '''
+                    }
+                }
+
+                stage('Stash Artifacts') {
+                    steps {
+                        script {
+                            def artifactDir = "${env.WORKSPACE}\\publish_output"
+                            powershell "Remove-Item -Recurse -Force '${artifactDir}' -ErrorAction SilentlyContinue"
+                            powershell "New-Item -ItemType Directory -Force -Path '${artifactDir}' | Out-Null"
+                            powershell "Copy-Item -Path '${env.WORKSPACE_PUBLISH_DIR}\\*' -Destination '${artifactDir}' -Recurse -Force"
+                        }
+                        stash includes: 'publish_output/**', name: 'build_artifacts'
+                    }
+                }
+            }
+        }
+
+        stage('Deployment Stage') {
+            agent { label 'aws-marketmaya-global-window' }
+
+            stages {
+                stage('Unstash Artifacts') {
+                    steps {
+                        
+                        unstash 'build_artifacts'
+                    }
+                }
+
+                stage('Service & Deployment Tasks') {
+                    steps {
+                        powershell '''
+                            $ErrorActionPreference = 'Stop'
+                            $publishDir = "$env:WORKSPACE\\publish_output"
+                            $deployRoot = "$env:DEPLOY_ROOT"
+                            $svcName = "$env:SERVICE_NAME"
+                            $procName   = "$env:PROCESS_NAME"
+                            $allowedExt = @('.exe','.dll','.pdb')
+                            $allowedJson = "$env:ALLOWED_JSON"
+
+                            # --- 1. Stop service ---
+                            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                            if ($svc -and $svc.Status -ne 'Stopped') {
+                                Write-Host "Stopping service: $svcName"
+                                Stop-Service -Name $svcName -Force
+                                Start-Sleep -Seconds 5
+                            } else {
+                                Write-Host "Service $svcName already stopped or not installed."
+                            }
+
+                            # --- 2. Copy files ---
+                            if (Test-Path $publishDir) {
+                                $files = Get-ChildItem -Path $publishDir -Recurse | Where-Object {
+                                    -not $_.PSIsContainer -and (
+                                        $allowedExt -contains $_.Extension.ToLower() -or
+                                        $_.Name -ieq $allowedJson
+                                    )
+                                }
+
+                                foreach ($src in $files) {
+                                    $relativePath = $src.FullName.Substring($publishDir.Length).TrimStart('\\')
+                                    $dst = Join-Path $deployRoot $relativePath
+                                    $dstDir = Split-Path $dst -Parent
+                                    if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
+
+                                    $retry = 5
+                                    while ($retry -gt 0) {
+                                        try {
+                                            Copy-Item -Path $src.FullName -Destination $dst -Force -ErrorAction Stop
+                                            Write-Host "Copied: $relativePath"
+                                            break
+                                        } catch {
+                                            Write-Host "File locked, retrying in 5s..."
+                                            Start-Sleep -Seconds 5
+                                            $retry--
+                                        }
+                                    }
+                                    if ($retry -eq 0) { Write-Host "Failed to copy $relativePath after retries." }
+                                }
+                            } else {
+                                Write-Host " Publish directory not found: $publishDir. Skipping deployment."
+                            }
+
+                            # --- 3. Restart service & health check ---
+                            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                            if (-not $svc) { Write-Host "$svcName not installed"; exit 1 }
+
+                            $maxWait = 20
+                            $elapsed = 0
+                            while ($svc.Status -ne 'Running' -and $elapsed -lt $maxWait) {
+                                Start-Service -Name $svcName -ErrorAction SilentlyContinue
+                                Start-Sleep -Seconds 5
+                                $elapsed += 2
+                                $svc.Refresh()
+                            }
+
+                            if ($svc.Status -eq 'Running') {
+                                $proc = Get-Process -Name $procName -ErrorAction SilentlyContinue
+                                if ($proc) {
+                                    Write-Host "Health check passed for $svcName (process $procName running)."
+                                } else {
+                                    Write-Host "$svcName is running but process $procName not found."
+                                }
+                            } else {
+                                Write-Host "$svcName failed to start within ${maxWait}s."
+                                exit 1
+                            }
+                        '''
+                    }
+                }
+
+                stage('Deployment summary') {
+                    steps {
+                        powershell '''
+                            Write-Host "===== DEPLOYMENT SUMMARY ====="
+                            $allowedExt = @('.exe','.dll','.pdb')
+                            $allowedJson = "$env:ALLOWED_JSON"
+                            $deployDir = "$env:DEPLOY_ROOT"
+                            if (Test-Path $deployDir) {
+                                $files = Get-ChildItem -Path $deployDir -Recurse | Where-Object {
+                                    -not $_.PSIsContainer -and (
+                                        $allowedExt -contains $_.Extension.ToLower() -or
+                                        $_.Name -ieq $allowedJson
+                                    )
+                                }
+                                Write-Host "Deployment folder: $deployDir"
+                                Write-Host "Files deployed here (allowed types + allowed JSON): $($files.Count)`n"
+                            } else {
+                                Write-Host "Deployment folder missing: $deployDir"
+                            }
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ Deployment successful." }
+        failure { echo "❌ Deployment failed. Check console logs." }
+        always  { echo "ℹ️ Build complete." }
+    }
+}
