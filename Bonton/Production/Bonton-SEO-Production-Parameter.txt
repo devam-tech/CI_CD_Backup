@@ -1,0 +1,152 @@
+pipeline {
+    agent none
+	
+	parameters {
+        string(name: 'REPO_BRANCH', defaultValue: 'main', description: 'Git branch to build and deploy')
+    }
+
+    environment {
+        REPO_URL    = 'https://github.com/MultiiconIdeotechnology/Bonton_Web_B2B_B2C.git'
+        GIT_CRED    = 'MM_PAT'
+
+        DEPLOY_ROOT   = 'C:\\Bonton\\Bonton V2\\SEO Sites'
+        EXCLUDE_FILE  = 'web.config'
+    }
+
+    stages {
+        stage('Checkout') {
+            agent { label 'built-in' }
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${REPO_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Build Angular') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    Write-Host " Installing npm dependencies..."
+                    npm install --legacy-peer-deps
+                    if ($LASTEXITCODE -ne 0) {
+                        throw " npm install failed."
+                    }
+
+                    Write-Host " Running Angular build (project: fuse, config: production)..."
+                    npx ng build fuse --configuration=production
+
+                    $browserPath = Join-Path $env:WORKSPACE "dist\\fuse\\browser"
+                    $defaultPath = Join-Path $env:WORKSPACE "dist\\fuse"
+
+                    if (Test-Path $browserPath) {
+                        $buildPath = $browserPath
+                        Write-Host " Using build path: dist/fuse/browser"
+                    } elseif (Test-Path $defaultPath) {
+                        $buildPath = $defaultPath
+                        Write-Host " Using build path: dist/fuse"
+                    } else {
+                        throw " Build failed. No valid dist folder found."
+                    }
+
+                    $count = (Get-ChildItem $buildPath -Recurse -File).Count
+                    Write-Host " Build completed. $buildPath contains $count files."
+
+                    # Save build path into env file
+                    echo "BUILD_PATH=$buildPath" | Out-File -FilePath $env:WORKSPACE\\build.env -Encoding utf8
+
+                    # Copy to publish_output folder
+                    $publishOutput = Join-Path $env:WORKSPACE "publish_output"
+                    if (Test-Path $publishOutput) { Remove-Item -Recurse -Force $publishOutput }
+                    New-Item -ItemType Directory -Path $publishOutput | Out-Null
+                    Copy-Item -Path "$buildPath/*" -Destination $publishOutput -Recurse -Force
+                '''
+            }
+        }
+
+        stage('Artifact + Stash') {
+            agent { label 'built-in' }
+            steps {
+                stash includes: 'publish_output/**, build.env', name: 'angular-build'
+            }
+        }
+
+        stage('Deployment') {
+            agent { label 'aws-bonton-windows' }
+            steps {
+                unstash 'angular-build'
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+
+                    # Load build path
+                    $envFile = "$env:WORKSPACE\\build.env"
+                    if (Test-Path $envFile) {
+                        Get-Content $envFile | ForEach-Object {
+                            if ($_ -match "^(.*?)=(.*)$") {
+                                Set-Item -Force -Path "env:$($matches[1])" -Value $matches[2]
+                            }
+                        }
+                    }
+
+                    $publishDir = Join-Path $env:WORKSPACE "publish_output"
+                    $deployRoot = "$env:DEPLOY_ROOT"
+
+                    if (-not (Test-Path $publishDir)) { throw " Publish folder not found: $publishDir" }
+
+                    # --- Deploy to ALL subfolders dynamically ---
+                    $subFolders = Get-ChildItem -Path $deployRoot -Directory
+                    if ($subFolders.Count -eq 0) {
+                        Write-Host " No subfolders found in $deployRoot"
+                    } else {
+                        foreach ($folder in $subFolders) {
+                            Write-Host "Deploying files from $publishDir to $($folder.FullName) (excluding $env:EXCLUDE_FILE)"
+                            robocopy "$publishDir" "$($folder.FullName)" /E /XF "$env:EXCLUDE_FILE"
+                            $rc = $LASTEXITCODE
+                            if ($rc -ge 8) {
+                                throw " Robocopy failed with exit code $rc"
+                            } else {
+                                Write-Host " Robocopy completed successfully. Exit code: $rc"
+                                $global:LASTEXITCODE = 0   # Force Jenkins to see success
+                            }
+                        }
+                    }
+
+                    Write-Host " Deployment completed successfully to all SEO subfolders."
+                '''
+            }
+        }
+
+        stage('Deployment Summary') {
+            agent { label 'aws-bonton-windows' }
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+
+                    $deployRoot = "$env:DEPLOY_ROOT"
+                    $exclude    = "$env:EXCLUDE_FILE"
+
+                    if (Test-Path $deployRoot) {
+                        $subFolders = Get-ChildItem -Path $deployRoot -Directory
+                        if ($subFolders.Count -eq 0) {
+                            Write-Host " No subfolders found under $deployRoot"
+                        } else {
+                            foreach ($folder in $subFolders) {
+                                $files = Get-ChildItem -Path $folder.FullName -Recurse -File | Where-Object { $_.Name -ne $exclude }
+                                Write-Host (" {0} → {1} files deployed (excluding {2})" -f $folder.Name, $files.Count, $exclude)
+                            }
+                        }
+                    } else {
+                        Write-Host " Deployment folder missing: $deployRoot"
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "Angular deployment successful." }
+        failure { echo "Deployment failed." }
+        always  { echo "Pipeline execution complete." }
+    }
+}

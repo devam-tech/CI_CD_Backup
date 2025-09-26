@@ -1,0 +1,125 @@
+pipeline {
+    agent none
+
+    parameters {
+        string(name: 'REPO_BRANCH', defaultValue: 'main', description: 'Git branch to build and deploy')
+    }
+
+    environment {
+        REPO_URL     = 'https://github.com/MultiiconIdeotechnology/Bonton_Web_BackOffice.git'
+        GIT_CRED     = 'MM_PAT'
+
+        DEPLOY_ROOT  = 'C:\\Bonton\\Bonton V2\\backoffice.bontonholidays.com'
+        EXCLUDE_FILE = 'web.config'
+    }
+
+    stages {
+        stage('Checkout') {
+            agent { label 'built-in' }
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${params.REPO_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Install Dependencies') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    Write-Host "Installing npm dependencies..."
+                    npm install --legacy-peer-deps
+                    if ($LASTEXITCODE -ne 0) { throw "npm install failed." }
+                '''
+            }
+        }
+
+        stage('Build Angular') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    Write-Host "Running Angular build (project: fuse, config: production)..."
+                    npx ng build fuse --configuration=production
+                '''
+            }
+        }
+
+        stage('Prepare Artifact') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    $browserPath = Join-Path $env:WORKSPACE "dist\\fuse\\browser"
+                    $defaultPath = Join-Path $env:WORKSPACE "dist\\fuse"
+
+                    if (Test-Path $browserPath) {
+                        $buildPath = $browserPath
+                        Write-Host "Using build path: dist/fuse/browser"
+                    } elseif (Test-Path $defaultPath) {
+                        $buildPath = $defaultPath
+                        Write-Host "Using build path: dist/fuse"
+                    } else {
+                        throw "Build failed. No valid dist folder found."
+                    }
+
+                    $publishDir = Join-Path $env:WORKSPACE "publish_output"
+                    if (Test-Path $publishDir) { Remove-Item -Recurse -Force $publishDir }
+                    New-Item -ItemType Directory -Path $publishDir | Out-Null
+                    Copy-Item -Path "$buildPath\\*" -Destination $publishDir -Recurse
+
+                    $count = (Get-ChildItem $publishDir -Recurse -File).Count
+                    Write-Host "Publish output ready. $publishDir contains $count files."
+                '''
+                archiveArtifacts artifacts: 'publish_output/**', fingerprint: true, onlyIfSuccessful: true
+                stash name: 'angular-artifact', includes: 'publish_output/**'
+            }
+        }
+
+        stage('Deploy') {
+            agent { label 'aws-bonton-windows' }
+            steps {
+                unstash 'angular-artifact'
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    $publishDir = Join-Path $env:WORKSPACE "publish_output"
+                    $deployRoot = "$env:DEPLOY_ROOT"
+
+                    if (-not (Test-Path $publishDir)) { throw "Publish folder not found: $publishDir" }
+
+                    Write-Host "Deploying files from $publishDir to $deployRoot (excluding $env:EXCLUDE_FILE)"
+                    robocopy "$publishDir" "$deployRoot" /E /XF "$env:EXCLUDE_FILE"
+                    $rc = $LASTEXITCODE
+                    if ($rc -ge 8) {
+                        throw "Robocopy failed with exit code $rc"
+                    } else {
+                        Write-Host "Robocopy completed successfully. Exit code: $rc"
+                        $global:LASTEXITCODE = 0
+                    }
+
+                    Write-Host "Deployment completed successfully."
+                '''
+            }
+        }
+
+        stage('Deployment Summary') {
+            agent { label 'aws-bonton-windows' }
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+                    if (Test-Path "$env:DEPLOY_ROOT") {
+                        $files = Get-ChildItem -Path "$env:DEPLOY_ROOT" -Recurse -File
+                        Write-Host ("Total files deployed (excluding $env:EXCLUDE_FILE): {0}" -f $files.Count)
+                    } else {
+                        Write-Host "Deployment folder missing!"
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ Angular deployment successful." }
+        failure { echo "❌ Deployment failed." }
+        always  { echo "ℹ️ Pipeline execution complete." }
+    }
+}
