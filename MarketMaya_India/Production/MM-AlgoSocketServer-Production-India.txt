@@ -1,0 +1,134 @@
+pipeline {
+    agent none
+
+    environment {
+        REPO_URL      = 'https://github.com/MultiiconIdeotechnology/MM_Algo_Socket_Server_Web.git'
+        REPO_BRANCH   = 'main'
+        GIT_CRED      = 'MM_PAT'
+
+        DOTNET_PROJECT = "MM_Algo_Socket_Server_Web.sln"
+        PUBLISH_DIR    = "publish_output"
+        DEPLOY_ROOT    = "C:\\MarketMaya\\Website\\algosocketserver.marketmaya.com"
+        APP_POOL_NAME  = "algosocketserver.marketmaya.com"
+        ALLOWED_JSON   = 'MM_Algo_Socket_Server_Web.deps.json'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            agent { label 'built-in' }
+            steps {
+                echo " Checking out branch '${env.REPO_BRANCH}' from repo '${env.REPO_URL}'..."
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "*/${env.REPO_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${env.REPO_URL}", credentialsId: "${env.GIT_CRED}"]]
+                ])
+            }
+        }
+
+        stage('Build & Publish') {
+            agent { label 'built-in' }
+            steps {
+                echo 'Building and publishing project...'
+
+                echo ' Restoring NuGet packages...'
+                bat "dotnet restore ${env.DOTNET_PROJECT}"
+
+                echo ' Building project in Release mode...'
+                bat "dotnet build ${env.DOTNET_PROJECT} -c Release"
+
+                echo ' Publishing project to output folder...'
+                bat "dotnet publish ${env.DOTNET_PROJECT} -c Release -o ${env.PUBLISH_DIR}"
+
+                // Stash publish_output for deployment stage
+                stash name: 'publish_artifact', includes: "${env.PUBLISH_DIR}/**"
+            }
+        }
+
+        stage('Deploy to IIS') {
+            agent { label 'aws-marketmaya-india-window' }
+            steps {
+                // Unstash files into workspace
+                unstash 'publish_artifact'
+
+                echo ' Deploying to IIS...'
+                powershell """
+					try {
+						# Stop App Pool (ignore if already stopped)
+						Write-Host " Stopping App Pool: ${env.APP_POOL_NAME}"
+						\$retries = 10
+						while (\$retries -gt 0) {
+							try {
+								Stop-WebAppPool -Name '${env.APP_POOL_NAME}' -ErrorAction Stop
+								Write-Host " App Pool stopped."
+								break
+							} catch {
+								Write-Warning "Retry stopping App Pool... (\$retries left)"
+								Start-Sleep -Seconds 7
+								\$retries--
+							}
+						}	
+
+						# App offline
+						Write-Host " App offline..."
+						Set-Content -Path '${env.DEPLOY_ROOT}\\app_offline.htm' -Value '<html>App is being updated, please wait...</html>'
+
+						# Copy files with minimal output
+						Write-Host " Copying files..."
+						robocopy '${env.PUBLISH_DIR}' '${env.DEPLOY_ROOT}' /E /XO /XF web.config *.json /XD Content Logs /NJH /NJS /NP /NS /NC
+						robocopy "${env.PUBLISH_DIR}" "${env.DEPLOY_ROOT}" "${env.ALLOWED_JSON}" /XO /NFL /NDL /NP
+						\$rc = \$LASTEXITCODE
+
+						# Bring app online
+						Remove-Item '${env.DEPLOY_ROOT}\\app_offline.htm' -Force
+						Write-Host " App online."
+
+						# Start App Pool with retry
+						Write-Host " Starting App Pool: ${env.APP_POOL_NAME}"
+						\$retries = 5
+						while (\$retries -gt 0) {
+							try {
+								Start-WebAppPool -Name '${env.APP_POOL_NAME}'
+								Write-Host " App Pool started successfully."
+								break
+							} catch {
+								Write-Warning " Could not start App Pool. Retrying in 10 seconds..."
+								Start-Sleep -Seconds 10
+								\$retries--
+								if (\$retries -eq 0) { 
+									Write-Error " Failed to start App Pool after multiple attempts."
+									exit 1
+								}
+							}
+						}
+
+						# Robocopy exit code handling (0-7 success, 8+ failure)
+						if (\$rc -ge 0 -and \$rc -le 7) {
+							Write-Host " Deployment completed successfully! (Robocopy Exit Code: \$rc)"
+							exit 0  # Force Jenkins to see this as success
+						} else {
+							Write-Error " Deployment failed! (Robocopy Exit Code: \$rc)"
+							exit 1
+						}
+
+					} catch {
+						Write-Error " Deployment failed: \$_.Exception.Message"
+						exit 1
+					}
+				"""
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Pipeline completed successfully!'
+        }
+        failure {
+            echo '❌ Pipeline failed. Check logs for details.'
+        }
+        always {
+            echo '📝 Pipeline finished.'
+        }
+    }
+}

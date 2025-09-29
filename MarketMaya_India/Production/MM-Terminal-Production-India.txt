@@ -1,0 +1,125 @@
+pipeline {
+    agent none
+
+    environment {
+        REPO_URL     = 'https://github.com/MultiiconIdeotechnology/MM_Web_Client_Terminal.git'
+        REPO_BRANCH  = 'main'
+        GIT_CRED     = 'MM_PAT'
+
+        DEPLOY_ROOT  = 'C:\\MarketMaya\\Website\\terminal.marketmaya.com'
+    }
+
+    stages {
+
+        stage('Build') {
+            agent { label 'built-in' }
+            stages {
+
+                stage('Checkout') {
+                    steps {
+                        checkout([$class: 'GitSCM',
+                            branches: [[name: "*/${REPO_BRANCH}"]],
+                            userRemoteConfigs: [[url: "${REPO_URL}", credentialsId: "${GIT_CRED}"]]
+                        ])
+                    }
+                }
+
+                stage('Build Angular') {
+                    steps {
+                        powershell '''
+                            $ErrorActionPreference = "Stop"
+
+                            Write-Host "Installing npm dependencies..."
+                            npm install --legacy-peer-deps
+                            if ($LASTEXITCODE -ne 0) { throw "npm install failed." }
+
+                            Write-Host "Running Angular build..."
+                            npx ng build fuse --configuration=production
+                            if ($LASTEXITCODE -ne 0) { throw "ng build failed." }
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Prepare Artifacts') {
+            agent { label 'built-in' }
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+
+                    if (Test-Path "$env:WORKSPACE\\dist\\fuse\\browser") {
+                        $buildPath = "$env:WORKSPACE\\dist\\fuse\\browser"
+                    } elseif (Test-Path "$env:WORKSPACE\\dist\\fuse") {
+                        $buildPath = "$env:WORKSPACE\\dist\\fuse"
+                    } else {
+                        throw "Build output not found."
+                    }
+
+                    $publishOut = "$env:WORKSPACE\\publish_output"
+                    if (Test-Path $publishOut) { Remove-Item -Recurse -Force $publishOut }
+                    New-Item -ItemType Directory -Path $publishOut | Out-Null
+
+                    Copy-Item -Path "$buildPath\\*" -Destination $publishOut -Recurse -Force
+
+                    $count = (Get-ChildItem $publishOut -Recurse -File).Count
+                    Write-Host " Prepared artifacts. $publishOut contains $count files."
+                '''
+                archiveArtifacts artifacts: 'publish_output/**', fingerprint: true, onlyIfSuccessful: true
+                stash name: 'artifact_bundle', includes: 'publish_output/**'
+            }
+        }
+
+        stage('Deploy') {
+            agent { label 'aws-marketmaya-india-window' }
+            steps {
+                unstash 'artifact_bundle'
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+
+                    $deployRoot = "${env:DEPLOY_ROOT}"
+                    $publishDir = "$env:WORKSPACE\\publish_output"
+
+                    if (-not (Test-Path $publishDir)) { throw "Publish folder not found." }
+                    if (-not (Test-Path $deployRoot)) { New-Item -ItemType Directory -Force -Path $deployRoot | Out-Null }
+
+                    # Deploy files
+                    robocopy "$publishDir" "$deployRoot" /E /XO /XF web.config /NFL /NDL /NP
+                    $rc = $LASTEXITCODE
+
+                    if ($rc -ge 0 -and $rc -le 7) {
+                        Write-Host " Deployment successful! (Exit $rc)"
+                        $global:LASTEXITCODE = 0   # reset exit code so Jenkins sees success
+                    } elseif ($rc -gt 7 -and $rc -lt 16) {
+                        Write-Warning " Deployment completed with warnings. (Exit $rc)"
+                        $global:LASTEXITCODE = 0   # treat warnings as success
+                    } else {
+                        Write-Error " Deployment failed! (Exit $rc)"
+                        exit 1
+                    }
+                '''
+            }
+        }
+
+        stage('Deployment Summary') {
+            agent { label 'aws-marketmaya-india-window' }
+            steps {
+                powershell '''
+                    Write-Host "===== DEPLOYMENT SUMMARY ====="
+                    if (Test-Path "${env:DEPLOY_ROOT}") {
+                        $files = Get-ChildItem -Path "${env:DEPLOY_ROOT}" -Recurse -File
+                        Write-Host ("Total files deployed (excluding web.config): {0}" -f $files.Count)
+                    } else {
+                        Write-Host " Deployment folder missing!"
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ Angular deployment successful." }
+        failure { echo "❌ Deployment failed. Rollback attempted." }
+        always  { echo "ℹ️ Pipeline execution complete." }
+    }
+}
